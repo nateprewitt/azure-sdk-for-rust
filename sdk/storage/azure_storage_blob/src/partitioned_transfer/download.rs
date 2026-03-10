@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use std::{cmp::min, collections::VecDeque, ops::Range, sync::Arc};
+use std::{cmp::min, collections::VecDeque, ops::Range, sync::Arc, task::Poll};
 
 use async_trait::async_trait;
 use azure_core::{
@@ -9,7 +9,7 @@ use azure_core::{
     stream::BytesStream,
 };
 use bytes::Bytes;
-use futures::{stream::FuturesOrdered, StreamExt};
+use futures::{stream::FuturesUnordered, StreamExt};
 
 use crate::models::http_ranges::ContentRange;
 
@@ -20,15 +20,10 @@ pub(crate) trait PartitionedDownloadBehavior {
     async fn transfer_range(&self, range: Option<Range<usize>>) -> AzureResult<AsyncRawResponse>;
 }
 
-/// Returns a stream that runs up to parallel-many ranged downloads at a time.
+/// Returns a stream that runs up to `parallel` ranged downloads at a time.
 ///
-/// Downloads are stored in-order. The returned stream will produce an item only when the next
-/// download in the sequence has been buffered, regardless of the state of any other downloads.
-/// This means completed ranged downloads may sit for a while while earlier ones complete.
-///
-/// A download that has completed buffering but has not yet returned its buffer in the resulting
-/// stream will still count when determining current running operations. This is so the stream can
-/// promise its buffered bytes do not exceed parallel * partition_size.
+/// Completed chunks land in a slotted reorder buffer and are yielded
+/// in-order. Buffered bytes never exceed `2 * parallel * partition_size`.
 pub(crate) async fn download<Behavior>(
     range: Option<Range<usize>>,
     parallel: NonZero<usize>,
@@ -87,25 +82,72 @@ where
         None => VecDeque::new(),
     };
 
-    // the first operation has a different type from the others.
-    // fully type this variable out to specify dyn.
-    let fut: Pin<Box<dyn DownloadRangeFuture<Output = AzureResult<Bytes>>>> =
-        Box::pin(initial_response.into_body().collect());
-    let mut ops = FuturesOrdered::new();
-    ops.push_back(fut);
+    // Reorder buffer: chunks land out-of-order, drain_cursor yields in-order.
+    let buffer_size = parallel * 2;
+    let mut slots: Vec<Option<Bytes>> = (0..buffer_size).map(|_| None).collect();
+    let mut drain_cursor: usize = 0; // next chunk index to yield
+
+    type IndexedFuture = Pin<Box<dyn DownloadRangeFuture<Output = AzureResult<(usize, Bytes)>>>>;
+    let mut ops: FuturesUnordered<IndexedFuture> = FuturesUnordered::new();
+
+    // Submit the initial response body as chunk 0.
+    let initial_collect = initial_response.into_body().collect();
+    ops.push(Box::pin(async move {
+        initial_collect.await.map(|bytes| (0usize, bytes))
+    }));
+    let mut next_submit: usize = 1;
 
     let stream = futures::stream::poll_fn(move |cx| {
-        // fill to max parallel ops
-        while ops.len() < parallel {
-            match ranges.pop_front() {
-                Some(range) => {
-                    ops.push_back(Box::pin(download_range_to_bytes(client.clone(), range)))
+        loop {
+            // Refill before polling so new futures register wakers.
+            while ops.len() < parallel && next_submit - drain_cursor < buffer_size {
+                match ranges.pop_front() {
+                    Some(range) => {
+                        let idx = next_submit;
+                        next_submit += 1;
+                        let client = client.clone();
+                        ops.push(Box::pin(async move {
+                            download_range_to_bytes(client, range)
+                                .await
+                                .map(|bytes| (idx, bytes))
+                        }));
+                    }
+                    None => break,
                 }
-                None => break,
+            }
+
+            // Poll for one completed chunk.
+            match ops.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok((idx, bytes)))) => {
+                    slots[idx % buffer_size] = Some(bytes);
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => {
+                    // No more in-flight work, yield buffered head or end stream.
+                    return if let Some(bytes) = slots[drain_cursor % buffer_size].take() {
+                        drain_cursor += 1;
+                        Poll::Ready(Some(Ok(bytes)))
+                    } else {
+                        Poll::Ready(None)
+                    };
+                }
+                Poll::Pending => {
+                    // Nothing ready yet, yield buffered head or propagate pending.
+                    return if let Some(bytes) = slots[drain_cursor % buffer_size].take() {
+                        drain_cursor += 1;
+                        Poll::Ready(Some(Ok(bytes)))
+                    } else {
+                        Poll::Pending
+                    };
+                }
+            }
+
+            // Drain head if ready, otherwise loop for more.
+            if let Some(bytes) = slots[drain_cursor % buffer_size].take() {
+                drain_cursor += 1;
+                return Poll::Ready(Some(Ok(bytes)));
             }
         }
-
-        ops.poll_next_unpin(cx)
     });
 
     Ok(Box::pin(stream))
