@@ -88,8 +88,10 @@ where
     };
 
     let total_chunks = 1 + ranges.len(); // initial + remainder
+    let buffer_size = parallel * 2;
     let (tx, mut rx) = mpsc::channel::<AzureResult<(usize, Bytes)>>(parallel);
     let mut join_set = JoinSet::new();
+    let semaphore = Arc::new(Semaphore::new(parallel));
 
     // Spawn initial response body collection as chunk 0.
     let tx0 = tx.clone();
@@ -102,37 +104,45 @@ where
         let _ = tx0.send(result).await;
     });
 
-    // Spawn remaining chunk downloads with a semaphore for concurrency control.
-    let semaphore = Arc::new(Semaphore::new(parallel));
-    for (i, range) in ranges.into_iter().enumerate() {
-        let idx = i + 1; // chunk 0 is the initial response
-        let c = client.clone();
-        let sem = semaphore.clone();
-        let tx = tx.clone();
-        let capacity = range.end.saturating_sub(range.start);
-
-        join_set.spawn(async move {
-            let _permit = sem.acquire().await;
-            let result = async {
-                let response = c.transfer_range(Some(range)).await?;
-                response.into_body().collect_with_capacity(capacity).await
-            }
-            .await
-            .map(|bytes| (idx, bytes));
-            let _ = tx.send(result).await;
-        });
-    }
-
-    // Drop the original sender so the channel closes when all tasks finish.
-    drop(tx);
-
-    // Reorder buffer: chunks arrive out-of-order, drain_cursor yields in-order.
-    let buffer_size = parallel * 2;
+    // Remaining tasks are spawned lazily inside the stream, gated by a
+    // sliding window of buffer_size ahead of drain_cursor. This prevents
+    // slot collisions in the reorder buffer when total_chunks > buffer_size.
+    let mut ranges = ranges;
+    let mut next_spawn_idx: usize = 1; // chunk 0 already spawned
+    let mut tx_opt = Some(tx);
     let mut slots: Vec<Option<Bytes>> = (0..buffer_size).map(|_| None).collect();
     let mut drain_cursor: usize = 0;
 
     let stream = async_stream::try_stream! {
         while drain_cursor < total_chunks {
+            // Spawn tasks to fill the window up to buffer_size ahead of drain_cursor.
+            while next_spawn_idx - drain_cursor < buffer_size {
+                if let Some(range) = ranges.pop_front() {
+                    let idx = next_spawn_idx;
+                    let c = client.clone();
+                    let sem = semaphore.clone();
+                    let t = tx_opt.as_ref().expect("sender dropped before all tasks spawned").clone();
+                    let capacity = range.end.saturating_sub(range.start);
+
+                    join_set.spawn(async move {
+                        let _permit = sem.acquire().await;
+                        let result = async {
+                            let response = c.transfer_range(Some(range)).await?;
+                            response.into_body().collect_with_capacity(capacity).await
+                        }
+                        .await
+                        .map(|bytes| (idx, bytes));
+                        let _ = t.send(result).await;
+                    });
+                    next_spawn_idx += 1;
+                } else {
+                    // All tasks spawned. Drop the original sender so the
+                    // channel closes once every spawned task completes.
+                    tx_opt = None;
+                    break;
+                }
+            }
+
             // Drain any contiguous ready chunks from the reorder buffer.
             while let Some(bytes) = slots[drain_cursor % buffer_size].take() {
                 drain_cursor += 1;
