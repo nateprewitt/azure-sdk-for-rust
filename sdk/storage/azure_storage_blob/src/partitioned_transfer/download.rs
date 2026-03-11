@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-use std::{cmp::min, collections::VecDeque, ops::Range, sync::Arc, task::Poll};
+use std::{cmp::min, collections::VecDeque, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use azure_core::{
@@ -9,7 +9,10 @@ use azure_core::{
     stream::BytesStream,
 };
 use bytes::Bytes;
-use futures::{stream::FuturesUnordered, StreamExt};
+use tokio::{
+    sync::{mpsc, Semaphore},
+    task::JoinSet,
+};
 
 use crate::models::http_ranges::ContentRange;
 
@@ -22,8 +25,10 @@ pub(crate) trait PartitionedDownloadBehavior {
 
 /// Returns a stream that runs up to `parallel` ranged downloads at a time.
 ///
-/// Completed chunks land in a slotted reorder buffer and are yielded
-/// in-order. Buffered bytes never exceed `2 * parallel * partition_size`.
+/// Each chunk download is spawned as an independent tokio task for true
+/// multi-core parallelism. Completed chunks are sent through an mpsc channel,
+/// reordered, and yielded in sequence. Buffered bytes never exceed
+/// `parallel * partition_size` (the channel + reorder buffer combined).
 pub(crate) async fn download<Behavior>(
     range: Option<Range<usize>>,
     parallel: NonZero<usize>,
@@ -64,7 +69,7 @@ where
         },
     };
 
-    let mut ranges: VecDeque<_> = match initial_response
+    let ranges: VecDeque<_> = match initial_response
         .headers()
         .get_optional_as::<ContentRange, _>(&"content-range".into())?
     {
@@ -82,88 +87,101 @@ where
         None => VecDeque::new(),
     };
 
-    // Reorder buffer: chunks land out-of-order, drain_cursor yields in-order.
+    let total_chunks = 1 + ranges.len(); // initial + remainder
+    let (tx, mut rx) = mpsc::channel::<AzureResult<(usize, Bytes)>>(parallel);
+    let mut join_set = JoinSet::new();
+
+    // Spawn initial response body collection as chunk 0.
+    let tx0 = tx.clone();
+    join_set.spawn(async move {
+        let result = initial_response
+            .into_body()
+            .collect_with_capacity(partition_size)
+            .await
+            .map(|bytes| (0usize, bytes));
+        let _ = tx0.send(result).await;
+    });
+
+    // Spawn remaining chunk downloads with a semaphore for concurrency control.
+    let semaphore = Arc::new(Semaphore::new(parallel));
+    for (i, range) in ranges.into_iter().enumerate() {
+        let idx = i + 1; // chunk 0 is the initial response
+        let c = client.clone();
+        let sem = semaphore.clone();
+        let tx = tx.clone();
+        let capacity = range.end.saturating_sub(range.start);
+
+        join_set.spawn(async move {
+            let _permit = sem.acquire().await;
+            let result = async {
+                let response = c.transfer_range(Some(range)).await?;
+                response.into_body().collect_with_capacity(capacity).await
+            }
+            .await
+            .map(|bytes| (idx, bytes));
+            let _ = tx.send(result).await;
+        });
+    }
+
+    // Drop the original sender so the channel closes when all tasks finish.
+    drop(tx);
+
+    // Reorder buffer: chunks arrive out-of-order, drain_cursor yields in-order.
     let buffer_size = parallel * 2;
     let mut slots: Vec<Option<Bytes>> = (0..buffer_size).map(|_| None).collect();
-    let mut drain_cursor: usize = 0; // next chunk index to yield
+    let mut drain_cursor: usize = 0;
 
-    type IndexedFuture = Pin<Box<dyn DownloadRangeFuture<Output = AzureResult<(usize, Bytes)>>>>;
-    let mut ops: FuturesUnordered<IndexedFuture> = FuturesUnordered::new();
-
-    // Submit the initial response body as chunk 0.
-    let initial_collect = initial_response.into_body().collect();
-    ops.push(Box::pin(async move {
-        initial_collect.await.map(|bytes| (0usize, bytes))
-    }));
-    let mut next_submit: usize = 1;
-
-    let stream = futures::stream::poll_fn(move |cx| {
-        loop {
-            // Refill before polling so new futures register wakers.
-            while ops.len() < parallel && next_submit - drain_cursor < buffer_size {
-                match ranges.pop_front() {
-                    Some(range) => {
-                        let idx = next_submit;
-                        next_submit += 1;
-                        let client = client.clone();
-                        ops.push(Box::pin(async move {
-                            download_range_to_bytes(client, range)
-                                .await
-                                .map(|bytes| (idx, bytes))
-                        }));
-                    }
-                    None => break,
-                }
+    let stream = async_stream::try_stream! {
+        while drain_cursor < total_chunks {
+            // Drain any contiguous ready chunks from the reorder buffer.
+            while let Some(bytes) = slots[drain_cursor % buffer_size].take() {
+                drain_cursor += 1;
+                yield bytes;
             }
 
-            // Poll for one completed chunk.
-            match ops.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok((idx, bytes)))) => {
+            if drain_cursor >= total_chunks {
+                break;
+            }
+
+            // Wait for the next completed chunk from any spawned task.
+            match rx.recv().await {
+                Some(Ok((idx, bytes))) => {
                     slots[idx % buffer_size] = Some(bytes);
                 }
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => {
-                    // No more in-flight work, yield buffered head or end stream.
-                    return if let Some(bytes) = slots[drain_cursor % buffer_size].take() {
-                        drain_cursor += 1;
-                        Poll::Ready(Some(Ok(bytes)))
-                    } else {
-                        Poll::Ready(None)
-                    };
+                Some(Err(e)) => {
+                    Err(e)?;
                 }
-                Poll::Pending => {
-                    // Nothing ready yet, yield buffered head or propagate pending.
-                    return if let Some(bytes) = slots[drain_cursor % buffer_size].take() {
-                        drain_cursor += 1;
-                        Poll::Ready(Some(Ok(bytes)))
-                    } else {
-                        Poll::Pending
-                    };
+                None => {
+                    // Channel closed before all chunks arrived.
+                    // Check if any spawned task panicked.
+                    while let Some(task_result) = join_set.join_next().await {
+                        if let Err(join_err) = task_result {
+                            if join_err.is_panic() {
+                                Err(azure_core::error::Error::with_message(
+                                    azure_core::error::ErrorKind::Io,
+                                    format!("a download chunk task panicked: {join_err}"),
+                                ))?;
+                            }
+                        }
+                    }
+                    // All tasks completed without panic but we're still missing
+                    // chunks, should not happen, but guard against it.
+                    if drain_cursor < total_chunks {
+                        Err(azure_core::error::Error::with_message(
+                            azure_core::error::ErrorKind::Io,
+                            format!(
+                                "download incomplete: received {drain_cursor} of {total_chunks} chunks"
+                            ),
+                        ))?;
+                    }
+                    break;
                 }
-            }
-
-            // Drain head if ready, otherwise loop for more.
-            if let Some(bytes) = slots[drain_cursor % buffer_size].take() {
-                drain_cursor += 1;
-                return Poll::Ready(Some(Ok(bytes)));
             }
         }
-    });
+    };
 
     Ok(Box::pin(stream))
 }
-
-async fn download_range_to_bytes(
-    client: Arc<impl PartitionedDownloadBehavior>,
-    range: Range<usize>,
-) -> AzureResult<Bytes> {
-    let capacity = range.end.saturating_sub(range.start);
-    let response = client.transfer_range(Some(range)).await?;
-    response.into_body().collect_with_capacity(capacity).await
-}
-
-trait DownloadRangeFuture: Future + Send {}
-impl<T: Future + Send> DownloadRangeFuture for T {}
 
 #[cfg(test)]
 mod tests {
@@ -428,6 +446,36 @@ mod tests {
             .await?;
 
         assert_eq!(downloaded_data[..], data[..]);
+        assert_eq!(mock.invocations.lock().await.len(), segments);
+
+        Ok(())
+    }
+
+    /// Verifies byte-level integrity when chunks exceed buffer_size,
+    /// forcing slot reuse via wrap-around with random completion order.
+    #[tokio::test]
+    async fn download_reorder_buffer_wraps_correctly() -> AzureResult<()> {
+        let partition_size = NonZero::new(64).unwrap(); // tiny partitions
+        let parallel = NonZero::new(4).unwrap(); // buffer_size = 8
+        let segments: usize = 50; // 50 chunks >> 8 slots -> many wrap-arounds
+        let data_size = partition_size.get() * segments;
+
+        let data = get_random_data(data_size);
+        let mock = Arc::new(MockPartitionedDownloadBehavior::new(
+            data.clone(),
+            Some(1..10), // add random delays for out-of-order completion
+        ));
+
+        let downloaded_data = download(None, parallel, partition_size, mock.clone())
+            .await?
+            .buffer_all()
+            .await?;
+
+        assert_eq!(
+            downloaded_data[..],
+            data[..],
+            "Data integrity check failed after buffer slot wrap-around"
+        );
         assert_eq!(mock.invocations.lock().await.len(), segments);
 
         Ok(())
