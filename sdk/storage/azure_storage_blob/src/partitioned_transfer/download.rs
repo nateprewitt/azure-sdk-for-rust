@@ -157,8 +157,9 @@ async fn download_range_to_bytes(
     client: Arc<impl PartitionedDownloadBehavior>,
     range: Range<usize>,
 ) -> AzureResult<Bytes> {
+    let capacity = range.end.saturating_sub(range.start);
     let response = client.transfer_range(Some(range)).await?;
-    response.into_body().collect().await
+    response.into_body().collect_with_capacity(capacity).await
 }
 
 trait DownloadRangeFuture: Future + Send {}

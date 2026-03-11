@@ -311,8 +311,15 @@ impl AsyncResponseBody {
     }
 
     /// Collect the stream into a [`Bytes`] collection.
-    pub async fn collect(mut self) -> crate::Result<Bytes> {
-        let mut final_result = Vec::new();
+    pub async fn collect(self) -> crate::Result<Bytes> {
+        self.collect_with_capacity(0).await
+    }
+
+    /// Collect the stream into a [`Bytes`] collection, pre-allocating `capacity`
+    /// bytes. Use this when the expected size is known (e.g. from a ranged GET)
+    /// to avoid repeated reallocations.
+    pub async fn collect_with_capacity(mut self, capacity: usize) -> crate::Result<Bytes> {
+        let mut final_result = Vec::with_capacity(capacity);
 
         while let Some(res) = self.next().await {
             final_result.extend(&res?);
